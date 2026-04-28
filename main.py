@@ -114,21 +114,23 @@ def get_or_create_cycle(
     entry_day   = cycle_info["entry_day"]
 
     weekly = instruments.get_weekly_expiries(after=entry_day, before=expiry)
-    if len(weekly) >= 2:
-        midpoint = weekly[1]
-        log.info("Midpoint = 2nd weekly expiry: %s", midpoint)
-    else:
-        midpoint = cycle_info["calendar_midpoint"]
-        log.warning("Fewer than 2 weekly expiries — using calendar midpoint %s", midpoint)
+    if len(weekly) < 2:
+        log.error("Cannot find 2 weekly expiries between %s and %s — cannot set midpoint",
+                  entry_day, expiry)
+        return None
+    midpoint      = weekly[1]
+    first_weekly  = weekly[0]
+    log.info("Midpoint = 2nd weekly expiry: %s  1st weekly: %s", midpoint, first_weekly)
 
     cycle = CycleState(
-        monthly_expiry    = str(expiry),
-        entry_day         = str(entry_day),
-        calendar_midpoint = str(midpoint),
-        reentry_count     = 0,
-        reentry_cap       = settings.REENTRY_CAP,
-        bridge_threshold  = settings.BRIDGE_THRESHOLD,
-        status            = "WAITING",
+        monthly_expiry      = str(expiry),
+        entry_day           = str(entry_day),
+        calendar_midpoint   = str(midpoint),
+        first_weekly_expiry = str(first_weekly),
+        reentry_count       = 0,
+        reentry_cap         = settings.REENTRY_CAP,
+        bridge_threshold    = settings.BRIDGE_THRESHOLD,
+        status              = "WAITING",
     )
     state.save_cycle(cycle)
     log.info("New cycle: expiry=%s entry=%s mid=%s",
@@ -181,6 +183,34 @@ def _exit_spread(short_leg, long_leg, kite: KiteClient, order_mgr: OrderManager,
     return spread_exit_cost_rs(short_leg.exit_price, long_leg.exit_price, settings.LOTS)
 
 
+def _enter_opposite_spread(
+    short_leg, long_leg,
+    kite: KiteClient,
+    order_mgr: OrderManager,
+    label: str,
+) -> tuple:
+    """v4: enter a fresh short spread at same strikes, current prices (wings first).
+    Returns (short_fill, long_fill, extra_cost_rs) or raises OrderFillError."""
+    symbols   = [short_leg.symbol, long_leg.symbol]
+    ltps      = kite.option_ltps(symbols)
+    short_ltp = ltps.get(short_leg.symbol, short_leg.entry_price)
+    long_ltp  = ltps.get(long_leg.symbol,  long_leg.entry_price)
+    qty       = settings.LOT_SIZE * settings.LOTS
+    log.info("BE-REENTRY %s: sell %s %.2f buy %s %.2f",
+             label, short_leg.symbol, short_ltp, long_leg.symbol, long_ltp)
+    if settings.DRY_RUN:
+        log.info("[DRY RUN] BE-REENTRY %s skipped order placement", label)
+        short_fill = short_ltp
+        long_fill  = long_ltp
+    else:
+        long_fill  = order_mgr.execute_leg(long_leg.symbol,  "BUY",  qty, long_ltp)
+        short_fill = order_mgr.execute_leg(short_leg.symbol, "SELL", qty, short_ltp)
+    from costs_model import leg_cost
+    extra_cost = (leg_cost(short_fill, settings.LOTS, "sell") +
+                  leg_cost(long_fill,  settings.LOTS, "buy"))
+    return short_fill, long_fill, extra_cost
+
+
 def monitor_loop(
     cycle: CycleState,
     state: TradeState,
@@ -227,7 +257,7 @@ def monitor_loop(
                     intr_l = max(spot - l.strike, 0) if opt_type == "CE" else max(l.strike - spot, 0)
                     s.exit_price = intr_s; s.exited = True; s.exit_reason = "EXPIRY"
                     l.exit_price = intr_l; l.exited = True; l.exit_reason = "EXPIRY"
-            finalize_pnl(pos, pos.exit_cost_rs)
+            finalize_pnl(pos, 0)
             state.add_pnl(pos.net_pnl_rs)
             cycle.upsert_position(pos)
             cycle.status = "DONE"
@@ -276,21 +306,69 @@ def monitor_loop(
                         ec = _exit_spread(pos.short_ce, pos.long_ce, kite, order_mgr, "SL_INTRADAY_CE")
                         pos.ce_exited = True
                         pos.exit_cost_rs += ec
+                        # Crystallize CE spread P&L (needed for finalize_pnl)
+                        pos.crystallized_pnl_rs += (pos.short_ce.pnl_per_unit() + pos.long_ce.pnl_per_unit()) * settings.LOT_SIZE * settings.LOTS
+                        # v4: opposite-side re-entry before 1st weekly expiry
+                        first_wk = cycle.first_weekly_expiry
+                        if (not pos.be_reentry_done and first_wk and
+                                str(today) <= first_wk):
+                            try:
+                                pe_fill, wpe_fill, be_cost = _enter_opposite_spread(
+                                    pos.short_pe, pos.long_pe, kite, order_mgr, "BE_REENTRY_PE")
+                                from strategy.position import Leg as _Leg
+                                qty = settings.LOT_SIZE * settings.LOTS
+                                pos.extra_short_pe = _Leg(pos.short_pe.symbol, pos.short_pe.strike, "PE", "short", -qty, pe_fill)
+                                pos.extra_long_pe  = _Leg(pos.long_pe.symbol,  pos.long_pe.strike,  "PE", "long",   qty, wpe_fill)
+                                pos.entry_cost_rs += be_cost
+                                pos.be_reentry_done = True
+                                # Recalculate lower BE: combined credit / 2 determines new BE
+                                orig_pe_nc = pos.short_pe.entry_price - pos.long_pe.entry_price
+                                new_pe_nc  = pe_fill - wpe_fill
+                                combined_nc = orig_pe_nc + new_pe_nc
+                                pos.lower_be = pos.short_pe.strike - combined_nc / 2.0
+                                pos.upper_be = float("inf")  # CE closed, no upper risk
+                                tg.error(f"v4 BE-REENTRY PE: added fresh PE spread spot={spot:.0f} lower_be={pos.lower_be:.0f}")
+                                log.info("BE-REENTRY PE added: new_lower_be=%.0f", pos.lower_be)
+                            except Exception as be_err:
+                                log.error("BE re-entry (PE) failed: %s", be_err)
                         cycle.upsert_position(pos)
                         state.save_cycle(cycle)
                         tg.one_sided_exit("UPPER", spot)
-                        log.info("ONE-SIDED CE EXIT spot=%.0f", spot)
+                        log.info("ONE-SIDED CE EXIT spot=%.0f be_reentry=%s", spot, pos.be_reentry_done)
                     elif breach == "LOWER" and not pos.pe_exited:
                         ec = _exit_spread(pos.short_pe, pos.long_pe, kite, order_mgr, "SL_INTRADAY_PE")
                         pos.pe_exited = True
                         pos.exit_cost_rs += ec
+                        pos.crystallized_pnl_rs += (pos.short_pe.pnl_per_unit() + pos.long_pe.pnl_per_unit()) * settings.LOT_SIZE * settings.LOTS
+                        # v4: opposite-side re-entry before 1st weekly expiry
+                        first_wk = cycle.first_weekly_expiry
+                        if (not pos.be_reentry_done and first_wk and
+                                str(today) <= first_wk):
+                            try:
+                                ce_fill, wce_fill, be_cost = _enter_opposite_spread(
+                                    pos.short_ce, pos.long_ce, kite, order_mgr, "BE_REENTRY_CE")
+                                from strategy.position import Leg as _Leg
+                                qty = settings.LOT_SIZE * settings.LOTS
+                                pos.extra_short_ce = _Leg(pos.short_ce.symbol, pos.short_ce.strike, "CE", "short", -qty, ce_fill)
+                                pos.extra_long_ce  = _Leg(pos.long_ce.symbol,  pos.long_ce.strike,  "CE", "long",   qty, wce_fill)
+                                pos.entry_cost_rs += be_cost
+                                pos.be_reentry_done = True
+                                orig_ce_nc = pos.short_ce.entry_price - pos.long_ce.entry_price
+                                new_ce_nc  = ce_fill - wce_fill
+                                combined_nc = orig_ce_nc + new_ce_nc
+                                pos.upper_be = pos.short_ce.strike + combined_nc / 2.0
+                                pos.lower_be = -float("inf")  # PE closed, no lower risk
+                                tg.error(f"v4 BE-REENTRY CE: added fresh CE spread spot={spot:.0f} upper_be={pos.upper_be:.0f}")
+                                log.info("BE-REENTRY CE added: new_upper_be=%.0f", pos.upper_be)
+                            except Exception as be_err:
+                                log.error("BE re-entry (CE) failed: %s", be_err)
                         cycle.upsert_position(pos)
                         state.save_cycle(cycle)
                         tg.one_sided_exit("LOWER", spot)
-                        log.info("ONE-SIDED PE EXIT spot=%.0f", spot)
+                        log.info("ONE-SIDED PE EXIT spot=%.0f be_reentry=%s", spot, pos.be_reentry_done)
 
                     if pos.ce_exited and pos.pe_exited:
-                        finalize_pnl(pos, pos.exit_cost_rs)
+                        finalize_pnl(pos, 0)
                         state.add_pnl(pos.net_pnl_rs)
                         cycle.upsert_position(pos)
                         cycle.status = "DONE"
@@ -456,7 +534,7 @@ def main():
                     tg.error(f"Re-entry cap {cycle.reentry_cap} reached — no further re-entry this cycle")
 
             if should_enter:
-                if not cb.check_margin(estimated_margin=(settings.LOTS * settings.MARGIN_PER_LOT)):
+                if not cb.check_margin(estimated_margin=(settings.LOTS * settings.MARGIN_ESTIMATE_PER_LOT)):
                     tg.error("Insufficient margin — skipping entry")
                 else:
                     cycle.status = "ENTERING"
