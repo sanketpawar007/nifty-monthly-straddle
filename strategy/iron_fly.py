@@ -3,13 +3,14 @@ Core Iron Fly strategy engine — v3 rules (Nifty edition).
 
 Strategy rules encoded here (all match the v3_ironfly backtest):
   Entry   : 11:00 AM IST, 1st trading day of month
-  ATM     : nearest 50-pt strike to Nifty spot (round-half-up)
-  Wings   : round(NC_sell / 50) * 50  (nearest 50-pt, min 50)
-  Target  : MTM ≥ 50% × NET_NC × units → full exit
-  SL      : MTM ≤ -SL_PCT × NET_NC × units → full exit
-  Re-entry: if SL before midpoint, 1 re-entry on same expiry at 11:00 AM
-  Partial : if spot drifts ≥ 100% × NET_NC beyond ATM on one side (first half only)
-            exit ONLY that 2-leg spread; no SL on remaining leg
+  ATM     : nearest 50-pt strike to Nifty spot LTP (round-half-up)
+  Wings   : round_half_up(gross_credit / 50) * 50  (min 50 pts)
+  Margin  : fetched via basket_margin API BEFORE orders — abort if unavailable
+  SL      : MTM_RS ≤ -(4% × margin_blocked) → full exit
+  Target  : MTM_RS ≥  (8% × margin_blocked) → full exit  [4:8 RR on capital]
+  Re-entry: if SL before 2nd-weekly midpoint, 1 re-entry on same expiry at 11:00 AM
+  Partial : spot crosses breakeven on one side (first half only) →
+            exit ONLY that 2-leg spread; remaining leg monitors independently
   Gap     : 9:15 open outside breakevens → exit immediately
   Bridge  : 9:15→11:00 spot must stay within ±1% of gap_open for re-entry
 """
@@ -30,6 +31,23 @@ IST = pytz.timezone("Asia/Kolkata")
 log = get_logger("iron_fly")
 
 
+def _basket_orders(short_ce_sym, short_pe_sym, long_ce_sym, long_pe_sym, qty):
+    return [
+        {"exchange": "NFO", "tradingsymbol": short_ce_sym,
+         "transaction_type": "SELL", "variety": "regular",
+         "product": settings.ORDER_PRODUCT, "order_type": "MARKET", "quantity": qty},
+        {"exchange": "NFO", "tradingsymbol": short_pe_sym,
+         "transaction_type": "SELL", "variety": "regular",
+         "product": settings.ORDER_PRODUCT, "order_type": "MARKET", "quantity": qty},
+        {"exchange": "NFO", "tradingsymbol": long_ce_sym,
+         "transaction_type": "BUY", "variety": "regular",
+         "product": settings.ORDER_PRODUCT, "order_type": "MARKET", "quantity": qty},
+        {"exchange": "NFO", "tradingsymbol": long_pe_sym,
+         "transaction_type": "BUY", "variety": "regular",
+         "product": settings.ORDER_PRODUCT, "order_type": "MARKET", "quantity": qty},
+    ]
+
+
 def build_entry(
     kite: KiteClient,
     instruments: InstrumentManager,
@@ -42,12 +60,14 @@ def build_entry(
     expiry  = date.fromisoformat(cycle.monthly_expiry)
     now_ist = datetime.now(tz=IST)
 
+    # ── 1. Spot via LTP ──────────────────────────────────────────────────────
     spot = kite.nifty_spot()
-    log.info("Spot at entry: %.2f", spot)
+    log.info("Spot at entry (LTP): %.2f", spot)
 
     atm = round_half_up(spot, settings.STRIKE_STEP)
     log.info("ATM strike: %s", atm)
 
+    # ── 2. Find ATM CE and PE symbols ────────────────────────────────────────
     ce_result = instruments.find_nearest_symbol(expiry, atm, "CE")
     pe_result = instruments.find_nearest_symbol(expiry, atm, "PE")
     if not ce_result or not pe_result:
@@ -57,6 +77,7 @@ def build_entry(
     short_ce_k, short_ce_sym = ce_result
     short_pe_k, short_pe_sym = pe_result
 
+    # ── 3. LTPs for ATM shorts ────────────────────────────────────────────────
     ltps = kite.option_ltps([short_ce_sym, short_pe_sym])
     p_ce = ltps.get(short_ce_sym, 0)
     p_pe = ltps.get(short_pe_sym, 0)
@@ -64,19 +85,23 @@ def build_entry(
         log.error("Zero LTP for ATM: CE=%.2f PE=%.2f", p_ce, p_pe)
         return None
 
+    # ── 4. Wing distance = round_half_up(gross_credit, 50), min 50 ───────────
     gross_short = p_ce + p_pe
     wing = max(round_half_up(gross_short, settings.STRIKE_STEP), settings.STRIKE_STEP)
+    log.info("Gross credit: %.2f  Wing distance: %s pts", gross_short, wing)
 
+    # ── 5. Find wing CE and PE symbols ───────────────────────────────────────
     uw_result = instruments.find_nearest_symbol(expiry, short_ce_k + wing, "CE", max_dist=300)
     lw_result = instruments.find_nearest_symbol(expiry, short_pe_k - wing, "PE", max_dist=300)
     if not uw_result or not lw_result:
-        log.error("Wing strikes not found. Upper=%s Lower=%s",
+        log.error("Wing strikes not found. Upper target=%s Lower target=%s",
                   short_ce_k + wing, short_pe_k - wing)
         return None
 
     long_ce_k, long_ce_sym = uw_result
     long_pe_k, long_pe_sym = lw_result
 
+    # ── 6. LTPs for wings ────────────────────────────────────────────────────
     wing_ltps = kite.option_ltps([long_ce_sym, long_pe_sym])
     q_ce = wing_ltps.get(long_ce_sym, 0)
     q_pe = wing_ltps.get(long_pe_sym, 0)
@@ -93,9 +118,27 @@ def build_entry(
     lower_be = short_pe_k - net_credit
     qty      = settings.LOT_SIZE * settings.LOTS
 
-    log.info("Iron Fly | ATM=%s NC=%.0f wings=(%s/%s) BE=(%.0f/%.0f)",
-             atm, net_credit, long_pe_k, long_ce_k, lower_be, upper_be)
+    log.info("Iron Fly | spot=%.0f ATM=%s NC=%.0f wings=(%s/%s) BE=(%.0f/%.0f)",
+             spot, atm, net_credit, long_pe_k, long_ce_k, lower_be, upper_be)
 
+    # ── 7. Fetch actual margin BEFORE placing any orders ─────────────────────
+    # Abort if unavailable — no fallback; inaccurate margin → wrong SL/Target
+    try:
+        margin = kite.basket_margin_rs(
+            _basket_orders(short_ce_sym, short_pe_sym, long_ce_sym, long_pe_sym, qty)
+        )
+        if margin <= 0:
+            log.error("basket_margin returned 0 — cannot compute SL/Target, aborting entry")
+            return None
+        sl_trigger_rs     = settings.SL_PCT * margin
+        target_trigger_rs = settings.TARGET_RS_PCT * margin
+        log.info("Margin: ₹%.0f | SL: ₹%.0f (4%%)  Target: ₹%.0f (8%%)",
+                 margin, sl_trigger_rs, target_trigger_rs)
+    except Exception as e:
+        log.error("basket_margin failed — cannot compute SL/Target, aborting entry: %s", e)
+        return None
+
+    # ── 8. Place orders (wings first per v3 §11.1) ───────────────────────────
     try:
         fills = order_mgr.enter_iron_fly(
             short_ce_sym, p_ce,
@@ -136,40 +179,18 @@ def build_entry(
     )
 
     from costs_model import entry_cost_rs
-    pos.entry_cost_rs = entry_cost_rs(p_ce_fill, p_pe_fill, q_ce_fill, q_pe_fill, settings.LOTS)
+    pos.entry_cost_rs     = entry_cost_rs(p_ce_fill, p_pe_fill, q_ce_fill, q_pe_fill, settings.LOTS)
+    pos.margin_blocked_rs = margin
+    pos.sl_trigger_rs     = sl_trigger_rs
 
-    try:
-        margin_orders = [
-            {"exchange": "NFO", "tradingsymbol": short_ce_sym,
-             "transaction_type": "SELL", "variety": "regular",
-             "product": settings.ORDER_PRODUCT, "order_type": "MARKET", "quantity": qty},
-            {"exchange": "NFO", "tradingsymbol": short_pe_sym,
-             "transaction_type": "SELL", "variety": "regular",
-             "product": settings.ORDER_PRODUCT, "order_type": "MARKET", "quantity": qty},
-            {"exchange": "NFO", "tradingsymbol": long_ce_sym,
-             "transaction_type": "BUY", "variety": "regular",
-             "product": settings.ORDER_PRODUCT, "order_type": "MARKET", "quantity": qty},
-            {"exchange": "NFO", "tradingsymbol": long_pe_sym,
-             "transaction_type": "BUY", "variety": "regular",
-             "product": settings.ORDER_PRODUCT, "order_type": "MARKET", "quantity": qty},
-        ]
-        margin = kite.basket_margin_rs(margin_orders)
-        pos.margin_blocked_rs = margin
-        pos.sl_trigger_rs = settings.SL_PCT * margin
-        log.info("Margin: ₹%.0f | SL trigger: ₹%.0f", margin, pos.sl_trigger_rs)
-    except Exception as e:
-        fallback = settings.MARGIN_PER_LOT * settings.LOTS
-        pos.margin_blocked_rs = fallback
-        pos.sl_trigger_rs = settings.SL_PCT * fallback
-        log.warning("basket_margin failed (%s) — fallback ₹%.0f", e, fallback)
-
-    log.info("ENTRY DONE | NC=%.0f BE=(%.0f/%.0f) entry_cost=₹%.0f",
-             net_credit_actual, lower_be_actual, upper_be_actual, pos.entry_cost_rs)
+    log.info("ENTRY DONE | NC=%.0f BE=(%.0f/%.0f) margin=₹%.0f SL=₹%.0f target=₹%.0f entry_cost=₹%.0f",
+             net_credit_actual, lower_be_actual, upper_be_actual,
+             margin, sl_trigger_rs, target_trigger_rs, pos.entry_cost_rs)
     return pos
 
 
 def compute_mtm(pos: IronFlyPosition, ltps: dict) -> float:
-    """Per-unit MTM of all active legs."""
+    """Per-unit MTM of all active legs (uses live LTPs from 1-min poll)."""
     mtm = 0.0
     for leg in pos.active_legs():
         current = ltps.get(leg.symbol)
@@ -183,14 +204,14 @@ def compute_mtm(pos: IronFlyPosition, ltps: dict) -> float:
 
 
 def should_exit_target(pos: IronFlyPosition, ltps: dict) -> bool:
-    """True when MTM ≥ 50% of active net credit (v3 §5.1)."""
-    mtm       = compute_mtm(pos, ltps)
-    threshold = settings.TARGET_PCT * pos.active_net_credit()
-    if threshold <= 0:
+    """True when MTM_RS ≥ 8% of margin_blocked — target side of 4:8 RR on capital."""
+    if pos.margin_blocked_rs <= 0:
         return False
-    if mtm >= threshold:
-        log.info("TARGET: mtm=%.1f >= %.1f (%.0f%% of NC=%.1f)",
-                 mtm, threshold, settings.TARGET_PCT * 100, pos.active_net_credit())
+    mtm_rs    = compute_mtm(pos, ltps) * settings.LOT_SIZE * settings.LOTS
+    target_rs = settings.TARGET_RS_PCT * pos.margin_blocked_rs
+    if mtm_rs >= target_rs:
+        log.info("TARGET: mtm_rs=₹%.0f >= ₹%.0f (%.0f%% of margin=₹%.0f)",
+                 mtm_rs, target_rs, settings.TARGET_RS_PCT * 100, pos.margin_blocked_rs)
         return True
     return False
 
@@ -227,7 +248,7 @@ def bridge_period_safe(
     """
     if max_deviation is not None:
         if max_deviation >= threshold:
-            log.info("BRIDGE: full-window max_dev=%.2f%% > %.2f%% — skip re-entry",
+            log.info("BRIDGE: full-window max_dev=%.2f%% >= %.2f%% — skip re-entry",
                      max_deviation * 100, threshold * 100)
             return False
         log.info("Bridge OK: max_dev=%.2f%%", max_deviation * 100)
@@ -242,14 +263,16 @@ def bridge_period_safe(
 
 
 def finalize_pnl(pos: IronFlyPosition, exit_cost_rs: float = 0.0):
-    """Compute gross and net P&L from all leg fills."""
-    gross = 0.0
-    for leg in [pos.short_ce, pos.short_pe, pos.long_ce, pos.long_pe]:
+    """Compute gross and net P&L from all leg fills (v4: includes extra legs + crystallized)."""
+    gross = pos.crystallized_pnl_rs
+    for leg in [pos.short_ce, pos.short_pe, pos.long_ce, pos.long_pe,
+                pos.extra_short_pe, pos.extra_long_pe,
+                pos.extra_short_ce, pos.extra_long_ce]:
         if leg is None:
             continue
         gross += leg.pnl_per_unit() * settings.LOT_SIZE * settings.LOTS
 
-    pos.exit_cost_rs = exit_cost_rs
+    pos.exit_cost_rs += exit_cost_rs
     pos.gross_pnl_rs = gross
-    pos.net_pnl_rs   = gross - pos.entry_cost_rs - exit_cost_rs
+    pos.net_pnl_rs   = gross - pos.entry_cost_rs - pos.exit_cost_rs
     pos.closed       = True
