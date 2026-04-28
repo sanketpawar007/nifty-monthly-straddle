@@ -217,11 +217,11 @@ def should_exit_target(pos: IronFlyPosition, ltps: dict) -> bool:
 
 
 def gap_breached(spot_open: float, pos: IronFlyPosition) -> Optional[str]:
-    """Check 9:15 AM open for gap outside breakevens."""
-    if spot_open >= pos.upper_be:
+    """Check 9:15 AM open for gap outside breakevens (respects already-exited sides)."""
+    if spot_open >= pos.upper_be and not pos.ce_exited:
         log.info("GAP_UP: open=%.0f >= upper_be=%.0f", spot_open, pos.upper_be)
         return "GAP_UP"
-    if spot_open <= pos.lower_be:
+    if spot_open <= pos.lower_be and not pos.pe_exited:
         log.info("GAP_DOWN: open=%.0f <= lower_be=%.0f", spot_open, pos.lower_be)
         return "GAP_DOWN"
     return None

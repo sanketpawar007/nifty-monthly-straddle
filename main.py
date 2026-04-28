@@ -183,6 +183,44 @@ def _exit_spread(short_leg, long_leg, kite: KiteClient, order_mgr: OrderManager,
     return spread_exit_cost_rs(short_leg.exit_price, long_leg.exit_price, settings.LOTS)
 
 
+def _exit_side_all_legs(
+    pos,
+    side: str,
+    kite,
+    order_mgr,
+    label: str,
+) -> float:
+    """Exit all legs on one side (original + extra). Crystallizes P&L. Returns total cost."""
+    if side == "CE":
+        legs = [l for l in [pos.short_ce, pos.long_ce,
+                             pos.extra_short_ce, pos.extra_long_ce] if l and not l.exited]
+    else:
+        legs = [l for l in [pos.short_pe, pos.long_pe,
+                             pos.extra_short_pe, pos.extra_long_pe] if l and not l.exited]
+    if not legs:
+        return 0.0
+    symbols = [l.symbol for l in legs]
+    ltps    = kite.option_ltps(symbols)
+    qty     = settings.LOT_SIZE * settings.LOTS
+    fills   = order_mgr.exit_all_active(legs, ltps, qty, label=label)
+    for leg in legs:
+        if leg.symbol in fills:
+            leg.exit_price  = fills[leg.symbol]
+            leg.exited      = True
+            leg.exit_reason = label
+    total_cost = 0.0
+    from costs_model import leg_cost as _lc
+    for leg in legs:
+        if leg.exited and leg.exit_price > 0:
+            s = "buy" if leg.direction == "short" else "sell"
+            total_cost += _lc(leg.exit_price, settings.LOTS, s)
+    pos.crystallized_pnl_rs += sum(l.pnl_per_unit() for l in legs) * settings.LOT_SIZE * settings.LOTS
+    pos.exit_cost_rs += total_cost
+    if side == "CE": pos.ce_exited = True
+    else:             pos.pe_exited = True
+    return total_cost
+
+
 def _enter_opposite_spread(
     short_leg, long_leg,
     kite: KiteClient,
@@ -367,7 +405,7 @@ def monitor_loop(
                         tg.one_sided_exit("LOWER", spot)
                         log.info("ONE-SIDED PE EXIT spot=%.0f be_reentry=%s", spot, pos.be_reentry_done)
 
-                    if pos.ce_exited and pos.pe_exited:
+                    if not pos.active_legs():
                         finalize_pnl(pos, 0)
                         state.add_pnl(pos.net_pnl_rs)
                         cycle.upsert_position(pos)
@@ -376,15 +414,28 @@ def monitor_loop(
                         tg.sl_exit("BOTH_SIDES", spot, pos.net_pnl_rs)
                         return
                 else:
-                    exit_cost = _exit_all_legs(pos, kite, order_mgr, tg, "SL_INTRADAY")
-                    finalize_pnl(pos, exit_cost)
-                    state.add_pnl(pos.net_pnl_rs)
-                    cycle.upsert_position(pos)
-                    cycle.status = "DONE"
-                    state.save_cycle(cycle)
-                    tg.sl_exit("SL_INTRADAY", spot, pos.net_pnl_rs)
-                    log.info("SL_INTRADAY EXIT spot=%.0f net_pnl=₹%.0f", spot, pos.net_pnl_rs)
-                    return
+                    # Second half: exit only the compromised side, keep opposite open
+                    if breach == "UPPER" and not pos.ce_exited:
+                        _exit_side_all_legs(pos, "CE", kite, order_mgr, "SL_2H_CE")
+                        cycle.upsert_position(pos)
+                        state.save_cycle(cycle)
+                        tg.one_sided_exit("UPPER_2H", spot)
+                        log.info("2H CE EXIT spot=%.0f — PE side continues", spot)
+                    elif breach == "LOWER" and not pos.pe_exited:
+                        _exit_side_all_legs(pos, "PE", kite, order_mgr, "SL_2H_PE")
+                        cycle.upsert_position(pos)
+                        state.save_cycle(cycle)
+                        tg.one_sided_exit("LOWER_2H", spot)
+                        log.info("2H PE EXIT spot=%.0f — CE side continues", spot)
+                    if not pos.active_legs():
+                        finalize_pnl(pos, 0)
+                        state.add_pnl(pos.net_pnl_rs)
+                        cycle.upsert_position(pos)
+                        cycle.status = "DONE"
+                        state.save_cycle(cycle)
+                        tg.sl_exit("BOTH_SIDES_2H", spot, pos.net_pnl_rs)
+                        log.info("BOTH_SIDES_2H EXIT net_pnl=₹%.0f", pos.net_pnl_rs)
+                        return
 
             _ce_p = ltps.get(pos.short_ce.symbol, 0) if pos.short_ce and not pos.ce_exited else 0
             _pe_p = ltps.get(pos.short_pe.symbol, 0) if pos.short_pe and not pos.pe_exited else 0
@@ -476,17 +527,17 @@ def main():
                 spot_open  = ohlc["open"]
                 gap        = gap_breached(spot_open, active_pos)
                 if gap:
-                    exit_cost = _exit_all_legs(active_pos, kite, order_mgr, tg, gap)
-                    finalize_pnl(active_pos, exit_cost)
-                    state.add_pnl(active_pos.net_pnl_rs)
+                    # v4: only exit the compromised side, keep opposite side open
+                    gap_side = "CE" if gap == "GAP_UP" else "PE"
+                    _exit_side_all_legs(active_pos, gap_side, kite, order_mgr, gap)
                     cycle.upsert_position(active_pos)
                     cycle.gap_open_price = spot_open
                     state.save_cycle(cycle)
-                    tg.gap_exit(gap, spot_open, active_pos.net_pnl_rs)
-                    log.info("GAP EXIT %s spot_open=%.0f", gap, spot_open)
+                    tg.one_sided_exit("UPPER_GAP" if gap == "GAP_UP" else "LOWER_GAP", spot_open)
+                    log.info("%s: %s spread exited, opposite side stays open", gap, gap_side)
                     gap_triggered  = True
                     gap_open_price = spot_open
-                    active_pos     = None
+                    # active_pos stays alive (opposite side still open)
 
         bridge_max_dev = 0.0
         if gap_triggered and gap_open_price > 0:
@@ -507,31 +558,62 @@ def main():
 
         wait_until("11:00")
 
+        # v4 gap re-entry: opposite-side spread before 1st weekly, else keep remaining open
+        if gap_triggered and active_pos and not active_pos.closed:
+            first_wk      = cycle.first_weekly_expiry
+            can_reenter   = (not active_pos.be_reentry_done and
+                             (cycle.reentry_cap == -1 or cycle.reentry_count < cycle.reentry_cap))
+            if can_reenter and first_wk and str(today) <= first_wk:
+                bridge_ok = bridge_period_safe(
+                    kite, gap_open_price, cycle.bridge_threshold,
+                    max_deviation=bridge_max_dev)
+                if bridge_ok:
+                    from strategy.position import Leg as _Leg
+                    qty = settings.LOT_SIZE * settings.LOTS
+                    try:
+                        if active_pos.ce_exited:   # GAP_UP — add fresh PE spread
+                            pe_f, wpe_f, bc = _enter_opposite_spread(
+                                active_pos.short_pe, active_pos.long_pe, kite, order_mgr, "GAP_REENTRY_PE")
+                            active_pos.extra_short_pe = _Leg(active_pos.short_pe.symbol, active_pos.short_pe.strike, "PE", "short", -qty, pe_f)
+                            active_pos.extra_long_pe  = _Leg(active_pos.long_pe.symbol,  active_pos.long_pe.strike,  "PE", "long",   qty, wpe_f)
+                            active_pos.entry_cost_rs += bc
+                            active_pos.be_reentry_done = True
+                            orig_nc = active_pos.short_pe.entry_price - active_pos.long_pe.entry_price
+                            new_nc  = pe_f - wpe_f
+                            active_pos.lower_be = active_pos.short_pe.strike - (orig_nc + new_nc) / 2.0
+                            active_pos.upper_be = float("inf")
+                            log.info("GAP_REENTRY_PE done lower_be=%.0f", active_pos.lower_be)
+                        elif active_pos.pe_exited:  # GAP_DOWN — add fresh CE spread
+                            ce_f, wce_f, bc = _enter_opposite_spread(
+                                active_pos.short_ce, active_pos.long_ce, kite, order_mgr, "GAP_REENTRY_CE")
+                            active_pos.extra_short_ce = _Leg(active_pos.short_ce.symbol, active_pos.short_ce.strike, "CE", "short", -qty, ce_f)
+                            active_pos.extra_long_ce  = _Leg(active_pos.long_ce.symbol,  active_pos.long_ce.strike,  "CE", "long",   qty, wce_f)
+                            active_pos.entry_cost_rs += bc
+                            active_pos.be_reentry_done = True
+                            orig_nc = active_pos.short_ce.entry_price - active_pos.long_ce.entry_price
+                            new_nc  = ce_f - wce_f
+                            active_pos.upper_be = active_pos.short_ce.strike + (orig_nc + new_nc) / 2.0
+                            active_pos.lower_be = -float("inf")
+                            log.info("GAP_REENTRY_CE done upper_be=%.0f", active_pos.upper_be)
+                        cycle.reentry_count += 1
+                        cycle.upsert_position(active_pos)
+                        state.save_cycle(cycle)
+                        tg.reentry(cycle.reentry_count, gap_open_price, 0, bridge_skipped=False)
+                    except Exception as _ge:
+                        log.error("Gap re-entry spread failed: %s", _ge)
+                else:
+                    log.info("Bridge failed — remaining side continues, no re-entry")
+                    tg.reentry(cycle.reentry_count + 1, gap_open_price, 0, bridge_skipped=True)
+            elif not can_reenter:
+                log.info("Re-entry cap or be_reentry_done — remaining side continues")
+            # else: after 1st weekly — keep remaining side open, no action
+
         if cycle.status != "DONE" and active_pos is None:
             should_enter = False
 
             if today == entry_date:
                 should_enter = True
                 log.info("Entry day — proceeding to entry")
-            elif gap_triggered:
-                can_reenter = (cycle.reentry_cap == -1 or
-                               cycle.reentry_count < cycle.reentry_cap)
-                if can_reenter:
-                    bridge_ok = bridge_period_safe(
-                        kite, gap_open_price,
-                        cycle.bridge_threshold,
-                        max_deviation=bridge_max_dev,
-                    )
-                    if bridge_ok:
-                        should_enter = True
-                        cycle.reentry_count += 1
-                        state.save_cycle(cycle)
-                        log.info("Re-entry #%d (bridge OK)", cycle.reentry_count)
-                    else:
-                        tg.reentry(cycle.reentry_count + 1, gap_open_price, 0, bridge_skipped=True)
-                else:
-                    log.info("Re-entry cap=%d reached — no re-entry", cycle.reentry_cap)
-                    tg.error(f"Re-entry cap {cycle.reentry_cap} reached — no further re-entry this cycle")
 
             if should_enter:
                 if not cb.check_margin(estimated_margin=(settings.LOTS * settings.MARGIN_ESTIMATE_PER_LOT)):
