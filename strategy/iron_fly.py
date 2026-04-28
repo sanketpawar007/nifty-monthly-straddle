@@ -263,12 +263,17 @@ def bridge_period_safe(
 
 
 def finalize_pnl(pos: IronFlyPosition, exit_cost_rs: float = 0.0):
-    """Compute gross and net P&L from all leg fills (v4: includes extra legs + crystallized)."""
-    gross = pos.crystallized_pnl_rs
+    """Compute gross and net P&L from all leg fills.
+
+    Start from 0 and sum only exited legs — every leg that was crystallised via
+    _exit_spread or _exit_side_all_legs already has leg.exited=True, so starting
+    from crystallised_pnl_rs would double-count those legs.
+    """
+    gross = 0.0
     for leg in [pos.short_ce, pos.short_pe, pos.long_ce, pos.long_pe,
                 pos.extra_short_pe, pos.extra_long_pe,
                 pos.extra_short_ce, pos.extra_long_ce]:
-        if leg is None:
+        if leg is None or not leg.exited:
             continue
         gross += leg.pnl_per_unit() * settings.LOT_SIZE * settings.LOTS
 
