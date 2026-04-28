@@ -1,0 +1,14 @@
+.env
+data/logs/
+data/instruments/
+data/state/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+secrets/
+bin/
+cron.log
+*.json

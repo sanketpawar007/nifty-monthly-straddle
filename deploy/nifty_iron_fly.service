@@ -1,0 +1,23 @@
+[Unit]
+Description=Nifty Monthly Iron Fly Live Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/path/to/nifty-monthly-ironfly
+ExecStart=/usr/bin/python3 /path/to/nifty-monthly-ironfly/main.py
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nifty_iron_fly
+
+EnvironmentFile=/path/to/nifty-monthly-ironfly/.env
+
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
