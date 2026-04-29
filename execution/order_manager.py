@@ -1,9 +1,8 @@
 """
-Order manager: place, wait, modify, market-convert for a single leg.
-v3 Section 11.1: BUY wings first, then SELL shorts.
+Order manager: MARKET orders only for all entry and exit legs.
+BUY wings first, then SELL shorts (Section 11.1).
 """
 import time
-from typing import Optional
 
 from market.kite_client import KiteClient, KiteAPIError
 from utils.logger import get_logger
@@ -25,66 +24,19 @@ class OrderManager:
         dry_run: bool = True,
         tag: str = "ironfly",
     ):
-        self.kite        = kite
-        self.product     = product
-        self.wait_secs   = wait_secs
-        self.tick_buffer = tick_buffer
-        self.dry_run     = dry_run
-        self.tag         = tag
-
-    def _limit_price(self, ltp: float, txn: str) -> float:
-        if txn == "BUY":
-            return round(ltp + self.tick_buffer, 2)
-        return round(max(ltp - self.tick_buffer, 0.05), 2)
+        self.kite     = kite
+        self.product  = product
+        self.dry_run  = dry_run
+        self.tag      = tag
 
     def execute_leg(self, symbol: str, txn: str, qty: int, ltp: float) -> float:
-        """
-        Place LIMIT order → wait → modify once → market.
-        Returns fill price (or LTP in dry-run).
-        """
-        price = self._limit_price(ltp, txn)
-
+        """Place MARKET order. Returns fill price (or LTP in dry-run)."""
         if self.dry_run:
-            log.info("[DRY RUN] %s %s qty=%d price=%.2f", txn, symbol, qty, price)
+            log.info("[DRY RUN] %s %s qty=%d ltp=%.2f", txn, symbol, qty, ltp)
             return ltp
 
         try:
             order_id = self.kite.place_order(
-                tradingsymbol=symbol,
-                transaction_type=txn,
-                quantity=qty,
-                price=price,
-                product=self.product,
-                order_type="LIMIT",
-                tag=self.tag,
-            )
-        except KiteAPIError as e:
-            raise OrderFillError(f"Place order failed for {symbol}: {e}")
-
-        time.sleep(min(self.wait_secs, 30))
-        status = self.kite.get_order_status(order_id)
-        if status.get("status") == "COMPLETE":
-            fill = float(status.get("average_price", price))
-            log.info("[ORDER] FILLED %s @ %.2f", symbol, fill)
-            return fill
-
-        new_price = round(price * 1.005 if txn == "BUY" else price * 0.995, 2)
-        try:
-            self.kite.modify_order(order_id, new_price)
-        except KiteAPIError as e:
-            log.warning("Modify failed, will try market: %s", e)
-
-        time.sleep(30)
-        status = self.kite.get_order_status(order_id)
-        if status.get("status") == "COMPLETE":
-            fill = float(status.get("average_price", new_price))
-            log.info("[ORDER] FILLED (after modify) %s @ %.2f", symbol, fill)
-            return fill
-
-        log.warning("Limit not filled — converting to MARKET: %s", symbol)
-        self.kite.cancel_order(order_id)
-        try:
-            mkt_id = self.kite.place_order(
                 tradingsymbol=symbol,
                 transaction_type=txn,
                 quantity=qty,
@@ -93,13 +45,14 @@ class OrderManager:
                 order_type="MARKET",
                 tag=self.tag,
             )
-            time.sleep(5)
-            mkt_status = self.kite.get_order_status(mkt_id)
-            fill = float(mkt_status.get("average_price", ltp))
-            log.info("[ORDER] MARKET FILLED %s @ %.2f", symbol, fill)
-            return fill
         except KiteAPIError as e:
-            raise OrderFillError(f"Market order failed for {symbol}: {e}")
+            raise OrderFillError(f"Place order failed for {symbol}: {e}")
+
+        time.sleep(5)
+        status = self.kite.get_order_status(order_id)
+        fill = float(status.get("average_price") or ltp)
+        log.info("[ORDER] MARKET FILLED %s %s @ %.2f", txn, symbol, fill)
+        return fill
 
     def enter_iron_fly(
         self,
