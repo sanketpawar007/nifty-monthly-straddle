@@ -46,12 +46,13 @@ class IronFlyPosition:
     ce_exited: bool  = False
     pe_exited: bool  = False
 
-    # v4: extra opposite-side spread added on BE breach before 1st weekly expiry
-    extra_short_pe: Optional[Leg] = None   # added when upper BE breached
+    # Extra opposite-side legs added on BE breach re-entry
+    extra_short_pe: Optional[Leg] = None   # added when upper BE breached (re-enter PE side)
     extra_long_pe:  Optional[Leg] = None
-    extra_short_ce: Optional[Leg] = None   # added when lower BE breached
+    extra_short_ce: Optional[Leg] = None   # added when lower BE breached (re-enter CE side)
     extra_long_ce:  Optional[Leg] = None
     be_reentry_done:     bool  = False
+    sl_target_voided:    bool  = False     # True after BE re-entry — no further SL/target checks
     crystallized_pnl_rs: float = 0.0
 
     margin_blocked_rs: float = 0.0
@@ -73,7 +74,6 @@ class IronFlyPosition:
         if not self.pe_exited:
             if self.short_pe: legs.append(self.short_pe)
             if self.long_pe:  legs.append(self.long_pe)
-        # v4 extra opposite-side legs
         for xl in [self.extra_short_pe, self.extra_long_pe,
                    self.extra_short_ce, self.extra_long_ce]:
             if xl: legs.append(xl)
@@ -111,16 +111,16 @@ class IronFlyPosition:
 
 @dataclass
 class CycleState:
-    monthly_expiry:   str
-    entry_day:        str
-    calendar_midpoint: str
+    monthly_expiry:      str
+    entry_day:           str
+    calendar_midpoint:   str
     first_weekly_expiry: str   = ""
-    reentry_count:    int   = 0
-    reentry_cap:      int   = 1
-    bridge_threshold: float = 0.01
-    gap_open_price:   float = 0.0
-    positions:        list  = field(default_factory=list)
-    status:           str   = "WAITING"
+    reentry_count:       int   = 0
+    reentry_cap:         int   = 1
+    bridge_threshold:    float = 0.01
+    gap_open_price:      float = 0.0
+    positions:           list  = field(default_factory=list)
+    status:              str   = "WAITING"
 
     def active_position(self) -> Optional[IronFlyPosition]:
         for pd in reversed(self.positions):
@@ -139,29 +139,29 @@ class CycleState:
 
     def to_dict(self) -> dict:
         return {
-            "monthly_expiry":    self.monthly_expiry,
-            "entry_day":         self.entry_day,
+            "monthly_expiry":      self.monthly_expiry,
+            "entry_day":           self.entry_day,
             "calendar_midpoint":   self.calendar_midpoint,
             "first_weekly_expiry": self.first_weekly_expiry,
             "reentry_count":       self.reentry_count,
-            "reentry_cap":       self.reentry_cap,
-            "bridge_threshold":  self.bridge_threshold,
-            "gap_open_price":    self.gap_open_price,
-            "positions":         self.positions,
-            "status":            self.status,
+            "reentry_cap":         self.reentry_cap,
+            "bridge_threshold":    self.bridge_threshold,
+            "gap_open_price":      self.gap_open_price,
+            "positions":           self.positions,
+            "status":              self.status,
         }
 
     @staticmethod
     def from_dict(d: dict) -> "CycleState":
         return CycleState(
-            monthly_expiry    = d["monthly_expiry"],
-            entry_day         = d["entry_day"],
+            monthly_expiry      = d["monthly_expiry"],
+            entry_day           = d["entry_day"],
             calendar_midpoint   = d["calendar_midpoint"],
             first_weekly_expiry = d.get("first_weekly_expiry", ""),
             reentry_count       = d.get("reentry_count", 0),
-            reentry_cap       = d.get("reentry_cap", 1),
-            bridge_threshold  = d.get("bridge_threshold", 0.01),
-            gap_open_price    = d.get("gap_open_price", 0.0),
-            positions         = d.get("positions", []),
-            status            = d.get("status", "WAITING"),
+            reentry_cap         = d.get("reentry_cap", 1),
+            bridge_threshold    = d.get("bridge_threshold", 0.01),
+            gap_open_price      = d.get("gap_open_price", 0.0),
+            positions           = d.get("positions", []),
+            status              = d.get("status", "WAITING"),
         )

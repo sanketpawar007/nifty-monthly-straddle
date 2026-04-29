@@ -22,9 +22,19 @@ NSE_HOLIDAYS: set[date] = {
     date(2025, 4, 14), date(2025, 4, 18), date(2025, 5, 1),  date(2025, 8, 15),
     date(2025, 8, 27), date(2025, 10, 2), date(2025, 10, 21),date(2025, 10, 24),
     date(2025, 11, 5), date(2025, 12, 25),
-    # 2026
-    date(2026, 1, 26), date(2026, 3, 20), date(2026, 4, 2),  date(2026, 4, 3),
-    date(2026, 4, 14), date(2026, 5, 1),
+    # 2026 — full NSE calendar (source: NSE circular / BSE holiday list)
+    date(2026, 1, 26),                    # Republic Day
+    date(2026, 3, 20),                    # Holi (2nd day)
+    date(2026, 4, 2),                     # Ram Navami / Good Friday (provisional)
+    date(2026, 4, 3),                     # Good Friday
+    date(2026, 4, 14),                    # Dr. Ambedkar Jayanti / Baisakhi
+    date(2026, 5, 1),                     # Maharashtra Day
+    date(2026, 8, 15),                    # Independence Day
+    date(2026, 10, 2),                    # Gandhi Jayanti
+    date(2026, 10, 21),                   # Diwali-Laxmi Puja (Muhurat — provisional)
+    date(2026, 10, 22),                   # Diwali Balipratipada (provisional)
+    date(2026, 11, 20),                   # Guru Nanak Jayanti (provisional)
+    date(2026, 12, 25),                   # Christmas
 }
 
 

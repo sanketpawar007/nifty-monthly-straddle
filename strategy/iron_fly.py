@@ -1,18 +1,14 @@
 """
-Core Iron Fly strategy engine — v3 rules (Nifty edition).
+Core Iron Fly strategy engine — v4 rules (Nifty edition).
 
-Strategy rules encoded here (all match the v3_ironfly backtest):
-  Entry   : 11:00 AM IST, 1st trading day of month
-  ATM     : nearest 50-pt strike to Nifty spot LTP (round-half-up)
-  Wings   : round_half_up(gross_credit / 50) * 50  (min 50 pts)
-  Margin  : fetched via basket_margin API BEFORE orders — abort if unavailable
-  SL      : MTM_RS ≤ -(4% × margin_blocked) → full exit
-  Target  : MTM_RS ≥  (8% × margin_blocked) → full exit  [4:8 RR on capital]
-  Re-entry: if SL before 2nd-weekly midpoint, 1 re-entry on same expiry at 11:00 AM
-  Partial : spot crosses breakeven on one side (first half only) →
-            exit ONLY that 2-leg spread; remaining leg monitors independently
-  Gap     : 9:15 open outside breakevens → exit immediately
-  Bridge  : 9:15→11:00 spot must stay within ±1% of gap_open for re-entry
+Entry   : 11:00 AM IST, T+1 after monthly expiry (1st trading day of new cycle)
+ATM     : nearest available strike to spot from options chain (not spot-derived rounding)
+Wings   : wingspan = ATM CE LTP + ATM PE LTP  (exact, no rounding)
+Margin  : fetched via basket_margin API BEFORE orders — abort if unavailable
+SL      : MTM_RS <= -(4% * margin_blocked)  -> full exit (no re-entry)
+Target  : MTM_RS >=  (8% * margin_blocked)  -> full exit (no re-entry)
+BE breach: exit compromised side only; re-enter opposite side if before 1st weekly expiry 3PM
+After re-entry: SL/target voided; hold both sides to monthly expiry; settle at 3:20 PM
 """
 from datetime import date, datetime
 from typing import Optional
@@ -22,7 +18,7 @@ import pytz
 from config.settings import settings
 from market.kite_client import KiteClient
 from market.instruments import InstrumentManager
-from strategy.expiry_calendar import round_half_up, is_first_half
+from strategy.expiry_calendar import round_half_up
 from strategy.position import IronFlyPosition, Leg, CycleState
 from execution.order_manager import OrderManager, OrderFillError
 from utils.logger import get_logger
@@ -64,18 +60,17 @@ def build_entry(
     spot = kite.nifty_spot()
     log.info("Spot at entry (LTP): %.2f", spot)
 
-    atm = round_half_up(spot, settings.STRIKE_STEP)
-    log.info("ATM strike: %s", atm)
-
-    # ── 2. Find ATM CE and PE symbols ────────────────────────────────────────
-    ce_result = instruments.find_nearest_symbol(expiry, atm, "CE")
-    pe_result = instruments.find_nearest_symbol(expiry, atm, "PE")
+    # ── 2. ATM from options chain (nearest available strike — not spot-derived rounding) ─
+    ce_result = instruments.find_nearest_symbol(expiry, spot, "CE")
+    pe_result = instruments.find_nearest_symbol(expiry, spot, "PE")
     if not ce_result or not pe_result:
-        log.error("No ATM options found for expiry %s strike %s", expiry, atm)
+        log.error("No ATM options found for expiry %s near spot %.2f", expiry, spot)
         return None
 
     short_ce_k, short_ce_sym = ce_result
     short_pe_k, short_pe_sym = pe_result
+    atm = short_ce_k
+    log.info("ATM strike (from chain): %s  CE=%s PE=%s", atm, short_ce_sym, short_pe_sym)
 
     # ── 3. LTPs for ATM shorts ────────────────────────────────────────────────
     ltps = kite.option_ltps([short_ce_sym, short_pe_sym])
@@ -85,14 +80,13 @@ def build_entry(
         log.error("Zero LTP for ATM: CE=%.2f PE=%.2f", p_ce, p_pe)
         return None
 
-    # ── 4. Wing distance = round_half_up(gross_credit, 50), min 50 ───────────
-    gross_short = p_ce + p_pe
-    wing = max(round_half_up(gross_short, settings.STRIKE_STEP), settings.STRIKE_STEP)
-    log.info("Gross credit: %.2f  Wing distance: %s pts", gross_short, wing)
+    # ── 4. Wing distance = ATM CE LTP + ATM PE LTP (exact, no rounding) ──────
+    wing = p_ce + p_pe
+    log.info("ATM premiums: CE=%.2f PE=%.2f  Wingspan=%.2f pts", p_ce, p_pe, wing)
 
-    # ── 5. Find wing CE and PE symbols ───────────────────────────────────────
-    uw_result = instruments.find_nearest_symbol(expiry, short_ce_k + wing, "CE", max_dist=300)
-    lw_result = instruments.find_nearest_symbol(expiry, short_pe_k - wing, "PE", max_dist=300)
+    # ── 5. Find wing CE and PE symbols at ATM +/- wingspan ───────────────────
+    uw_result = instruments.find_nearest_symbol(expiry, short_ce_k + wing, "CE", max_dist=500)
+    lw_result = instruments.find_nearest_symbol(expiry, short_pe_k - wing, "PE", max_dist=500)
     if not uw_result or not lw_result:
         log.error("Wing strikes not found. Upper target=%s Lower target=%s",
                   short_ce_k + wing, short_pe_k - wing)
@@ -111,18 +105,17 @@ def build_entry(
 
     net_credit = (p_ce + p_pe) - (q_ce + q_pe)
     if net_credit <= 0:
-        log.warning("Net credit ≤ 0 (%.2f) — skipping", net_credit)
+        log.warning("Net credit <= 0 (%.2f) — skipping", net_credit)
         return None
 
     upper_be = short_ce_k + net_credit
     lower_be = short_pe_k - net_credit
     qty      = settings.LOT_SIZE * settings.LOTS
 
-    log.info("Iron Fly | spot=%.0f ATM=%s NC=%.0f wings=(%s/%s) BE=(%.0f/%.0f)",
-             spot, atm, net_credit, long_pe_k, long_ce_k, lower_be, upper_be)
+    log.info("Iron Fly | spot=%.0f ATM=%s NC=%.0f wingspan=%.0f wings=(%s/%s) BE=(%.0f/%.0f)",
+             spot, atm, net_credit, wing, long_pe_k, long_ce_k, lower_be, upper_be)
 
     # ── 7. Fetch actual margin BEFORE placing any orders ─────────────────────
-    # Abort if unavailable — no fallback; inaccurate margin → wrong SL/Target
     try:
         margin = kite.basket_margin_rs(
             _basket_orders(short_ce_sym, short_pe_sym, long_ce_sym, long_pe_sym, qty)
@@ -138,7 +131,7 @@ def build_entry(
         log.error("basket_margin failed — cannot compute SL/Target, aborting entry: %s", e)
         return None
 
-    # ── 8. Place orders (wings first per v3 §11.1) ───────────────────────────
+    # ── 8. Place orders (wings first) ─────────────────────────────────────────
     try:
         fills = order_mgr.enter_iron_fly(
             short_ce_sym, p_ce,
@@ -204,7 +197,7 @@ def compute_mtm(pos: IronFlyPosition, ltps: dict) -> float:
 
 
 def should_exit_target(pos: IronFlyPosition, ltps: dict) -> bool:
-    """True when MTM_RS ≥ 8% of margin_blocked — target side of 4:8 RR on capital."""
+    """True when MTM_RS >= 8% of margin_blocked."""
     if pos.margin_blocked_rs <= 0:
         return False
     mtm_rs    = compute_mtm(pos, ltps) * settings.LOT_SIZE * settings.LOTS
@@ -216,17 +209,6 @@ def should_exit_target(pos: IronFlyPosition, ltps: dict) -> bool:
     return False
 
 
-def gap_breached(spot_open: float, pos: IronFlyPosition) -> Optional[str]:
-    """Check 9:15 AM open for gap outside breakevens (respects already-exited sides)."""
-    if spot_open >= pos.upper_be and not pos.ce_exited:
-        log.info("GAP_UP: open=%.0f >= upper_be=%.0f", spot_open, pos.upper_be)
-        return "GAP_UP"
-    if spot_open <= pos.lower_be and not pos.pe_exited:
-        log.info("GAP_DOWN: open=%.0f <= lower_be=%.0f", spot_open, pos.lower_be)
-        return "GAP_DOWN"
-    return None
-
-
 def intraday_breached(spot: float, pos: IronFlyPosition) -> Optional[str]:
     """Check if spot has crossed a breakeven during regular trading."""
     if spot >= pos.upper_be and not pos.ce_exited:
@@ -236,39 +218,24 @@ def intraday_breached(spot: float, pos: IronFlyPosition) -> Optional[str]:
     return None
 
 
-def bridge_period_safe(
-    kite: KiteClient,
-    gap_open: float,
-    threshold: float = settings.BRIDGE_THRESHOLD,
-    max_deviation: float = None,
-) -> bool:
-    """
-    v3 §6.3: spot must stay within ±threshold% of gap_open during 9:15→11:00.
-    max_deviation: pre-computed worst-case deviation across the full window.
-    """
-    if max_deviation is not None:
-        if max_deviation >= threshold:
-            log.info("BRIDGE: full-window max_dev=%.2f%% >= %.2f%% — skip re-entry",
-                     max_deviation * 100, threshold * 100)
-            return False
-        log.info("Bridge OK: max_dev=%.2f%%", max_deviation * 100)
-        return True
-    current_spot = kite.nifty_spot()
-    move_pct = abs(current_spot - gap_open) / gap_open
-    if move_pct >= threshold:
-        log.info("BRIDGE: spot=%.0f gap=%.0f move=%.2f%% — skip", current_spot, gap_open, move_pct * 100)
-        return False
-    log.info("Bridge OK: spot=%.0f move=%.2f%%", current_spot, move_pct * 100)
+def gap_breached(spot_open: float, pos: IronFlyPosition) -> Optional[str]:
+    """Check 9:15 AM open for gap outside breakevens (legacy, used in tests)."""
+    if spot_open >= pos.upper_be and not pos.ce_exited:
+        log.info("GAP_UP: open=%.0f >= upper_be=%.0f", spot_open, pos.upper_be)
+        return "GAP_UP"
+    if spot_open <= pos.lower_be and not pos.pe_exited:
+        log.info("GAP_DOWN: open=%.0f <= lower_be=%.0f", spot_open, pos.lower_be)
+        return "GAP_DOWN"
+    return None
+
+
+def bridge_period_safe(kite, gap_open, threshold=0.01, max_deviation=None) -> bool:
+    """Legacy stub — bridge logic removed in v4. Always returns True."""
     return True
 
 
 def finalize_pnl(pos: IronFlyPosition, exit_cost_rs: float = 0.0):
-    """Compute gross and net P&L from all leg fills.
-
-    Start from 0 and sum only exited legs — every leg that was crystallised via
-    _exit_spread or _exit_side_all_legs already has leg.exited=True, so starting
-    from crystallised_pnl_rs would double-count those legs.
-    """
+    """Compute gross and net P&L from all exited legs."""
     gross = 0.0
     for leg in [pos.short_ce, pos.short_pe, pos.long_ce, pos.long_pe,
                 pos.extra_short_pe, pos.extra_long_pe,
