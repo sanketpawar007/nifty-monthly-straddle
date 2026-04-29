@@ -552,7 +552,22 @@ def main():
                 else:
                     cycle.status = "ENTERING"
                     state.save_cycle(cycle)
-                    new_pos = build_entry(kite, instruments, order_mgr, cycle)
+                    new_pos = None
+                    try:
+                        new_pos = build_entry(kite, instruments, order_mgr, cycle)
+                    except KiteAuthError:
+                        log.warning("Token expired during entry — running autologin and retrying...")
+                        tg.error("Token expired during order placement — refreshing and retrying entry")
+                        if _run_autologin():
+                            try:
+                                new_token = token_mgr.refresh()
+                                kite.update_token(new_token)
+                                log.info("Token refreshed — retrying build_entry")
+                                new_pos = build_entry(kite, instruments, order_mgr, cycle)
+                            except Exception as _re:
+                                log.error("Entry retry after token refresh failed: %s", _re)
+                        else:
+                            log.error("Autologin failed — entry aborted")
                     if new_pos:
                         cycle.upsert_position(new_pos)
                         cycle.status = "MONITORING"

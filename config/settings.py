@@ -18,7 +18,7 @@ class Settings:
 
     # ── Strategy (v4 rules — Nifty) ───────────────────────────────────────────
     LOTS: int = int(os.getenv("LOTS", "1"))
-    LOT_SIZE: int = 75                     # Nifty NFO lot size (post 2025)
+    LOT_SIZE: int = 65                     # Nifty NFO lot size (post 2025)
     STRIKE_STEP: int = 50                  # Nifty strike interval
     SL_PCT: float = 0.04                  # 4% of actual margin blocked
     TARGET_RS_PCT: float = 0.08           # 8% of actual margin blocked

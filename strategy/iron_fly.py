@@ -21,6 +21,7 @@ from market.instruments import InstrumentManager
 from strategy.expiry_calendar import round_half_up
 from strategy.position import IronFlyPosition, Leg, CycleState
 from execution.order_manager import OrderManager, OrderFillError
+from market.kite_client import KiteAuthError
 from utils.logger import get_logger
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -140,6 +141,9 @@ def build_entry(
             long_pe_sym,  q_pe,
             qty=qty,
         )
+    except KiteAuthError as e:
+        log.error("Token expired during order placement: %s", e)
+        raise   # re-raise so main() can catch, refresh token, and retry
     except OrderFillError as e:
         log.error("Entry order failed: %s", e)
         return None

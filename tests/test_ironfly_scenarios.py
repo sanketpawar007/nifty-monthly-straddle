@@ -175,9 +175,9 @@ class TestEntryRules(unittest.TestCase):
         self.assertFalse(hasattr(settings, "MARGIN_PER_LOT"),
                          "MARGIN_PER_LOT (old fallback) must NOT exist")
 
-    def test_E10_lot_size_is_75_units(self):
-        """Nifty lot size (v4, 2025) = 75 units."""
-        self.assertEqual(settings.LOT_SIZE, 75)
+    def test_E10_lot_size_is_65_units(self):
+        """Nifty lot size (Nifty NFO lot size (NSE mandated) = 65 units."""
+        self.assertEqual(settings.LOT_SIZE, 65)
 
     def test_E11_net_credit_positive_required(self):
         """If gross_short ≤ gross_long, net_credit ≤ 0 — entry must be skipped."""
