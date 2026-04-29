@@ -36,6 +36,7 @@ After re-entry: SL/target voided; hold both sides to monthly expiry.
 import sys
 import time
 import signal
+import subprocess
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -94,6 +95,28 @@ def wait_until(target_hhmm: str, poll_secs: int = 5):
         time.sleep(poll_secs)
 
 
+def _run_autologin() -> bool:
+    """Run the autologin script to get a fresh Kite access token."""
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "zerodha_autologin.sh")
+    if not os.path.isfile(script):
+        log.error("Autologin script not found: %s", script)
+        return False
+    log.info("Running autologin to refresh token...")
+    try:
+        result = subprocess.run([script], capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            log.info("Autologin succeeded: %s", result.stdout.strip())
+            return True
+        log.error("Autologin failed (rc=%s): %s", result.returncode, result.stderr.strip())
+        return False
+    except subprocess.TimeoutExpired:
+        log.error("Autologin script timed out after 60s")
+        return False
+    except Exception as e:
+        log.error("Autologin error: %s", e)
+        return False
+
+
 def daily_startup(token_mgr: TokenManager) -> Optional[KiteClient]:
     try:
         token = token_mgr.load()
@@ -101,6 +124,20 @@ def daily_startup(token_mgr: TokenManager) -> Optional[KiteClient]:
         spot  = kite.nifty_spot()
         log.info("Kite connected. Nifty spot: %.2f", spot)
         return kite
+    except KiteAuthError:
+        log.warning("Token expired (403) — running autologin to refresh...")
+        if not _run_autologin():
+            log.error("Autologin failed — cannot connect to Kite")
+            return None
+        try:
+            token = token_mgr.refresh()
+            kite  = KiteClient(settings.KITE_API_KEY, token, settings.KITE_BASE_URL)
+            spot  = kite.nifty_spot()
+            log.info("Reconnected after autologin. Nifty spot: %.2f", spot)
+            return kite
+        except Exception as e:
+            log.error("Reconnect after autologin failed: %s", e)
+            return None
     except FileNotFoundError as e:
         log.error("Token file missing: %s", e)
         return None
@@ -236,6 +273,7 @@ def monitor_loop(
     order_mgr: OrderManager,
     tg: Telegram,
     cb: CircuitBreaker,
+    token_mgr: TokenManager,
 ):
     log.info("Entering monitor loop for cycle %s", cycle.monthly_expiry)
 
@@ -399,7 +437,16 @@ def monitor_loop(
                      " [SL/TGT VOIDED]" if pos.sl_target_voided else "")
 
         except KiteAuthError:
-            log.error("Auth error during monitoring — skipping this minute")
+            log.warning("Token expired during monitoring — running autologin...")
+            if _run_autologin():
+                try:
+                    new_token = token_mgr.refresh()
+                    kite.update_token(new_token)
+                    log.info("Token refreshed mid-session — resuming monitoring")
+                except Exception as _re:
+                    log.error("Token refresh failed after autologin: %s", _re)
+            else:
+                log.error("Autologin failed mid-session — skipping this minute")
         except Exception as e:
             log.error("Monitor error: %s", e, exc_info=True)
 
@@ -488,7 +535,7 @@ def main():
                     tg.error(f"GAP alert: Nifty {spot_open:.0f} below lower_be {active_pos.lower_be:.0f}")
             except Exception as e:
                 log.warning("Gap check error: %s", e)
-            monitor_loop(cycle, state, kite, order_mgr, tg, cb)
+            monitor_loop(cycle, state, kite, order_mgr, tg, cb, token_mgr)
 
         # ── Entry at 11:00 AM on entry day (if no position yet) ─────────────
         if cycle.status != "DONE" and not cycle.active_position():
@@ -516,7 +563,7 @@ def main():
                             new_pos.long_pe.strike if new_pos.long_pe else 0,
                             new_pos.long_ce.strike if new_pos.long_ce else 0,
                         )
-                        monitor_loop(cycle, state, kite, order_mgr, tg, cb)
+                        monitor_loop(cycle, state, kite, order_mgr, tg, cb, token_mgr)
                     else:
                         cycle.status = "WAITING"
                         state.save_cycle(cycle)
