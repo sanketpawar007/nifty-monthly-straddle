@@ -1,5 +1,7 @@
 """
-Order manager: MARKET orders only for all entry and exit legs.
+Order manager: aggressive LIMIT orders that fill like market orders.
+Kite API does not allow pure MARKET orders on NFO without market protection,
+so we use limit orders at LTP +5% (BUY) / -5% (SELL) — fills instantly.
 BUY wings first, then SELL shorts (Section 11.1).
 """
 import time
@@ -8,6 +10,8 @@ from market.kite_client import KiteClient, KiteAPIError
 from utils.logger import get_logger
 
 log = get_logger("order_manager")
+
+_SLIPPAGE = 0.05   # 5% away from LTP — fills instantly, acts like a market order
 
 
 class OrderFillError(Exception):
@@ -24,35 +28,51 @@ class OrderManager:
         dry_run: bool = True,
         tag: str = "ironfly",
     ):
-        self.kite     = kite
-        self.product  = product
-        self.dry_run  = dry_run
-        self.tag      = tag
+        self.kite    = kite
+        self.product = product
+        self.dry_run = dry_run
+        self.tag     = tag
+
+    def _aggressive_price(self, ltp: float, txn: str) -> float:
+        """5% above LTP for BUY, 5% below for SELL — fills like a market order."""
+        if txn == "BUY":
+            return round(ltp * (1 + _SLIPPAGE), 1)
+        return round(max(ltp * (1 - _SLIPPAGE), 0.05), 1)
 
     def execute_leg(self, symbol: str, txn: str, qty: int, ltp: float) -> float:
-        """Place MARKET order. Returns fill price (or LTP in dry-run)."""
+        """
+        Place aggressive LIMIT order (±5% of LTP). Fills essentially immediately.
+        Returns actual fill price (or LTP in dry-run).
+        """
         if self.dry_run:
             log.info("[DRY RUN] %s %s qty=%d ltp=%.2f", txn, symbol, qty, ltp)
             return ltp
 
+        price = self._aggressive_price(ltp, txn)
         try:
             order_id = self.kite.place_order(
                 tradingsymbol=symbol,
                 transaction_type=txn,
                 quantity=qty,
-                price=0,
+                price=price,
                 product=self.product,
-                order_type="MARKET",
+                order_type="LIMIT",
                 tag=self.tag,
             )
         except KiteAPIError as e:
             raise OrderFillError(f"Place order failed for {symbol}: {e}")
 
-        time.sleep(5)
-        status = self.kite.get_order_status(order_id)
-        fill = float(status.get("average_price") or ltp)
-        log.info("[ORDER] MARKET FILLED %s %s @ %.2f", txn, symbol, fill)
-        return fill
+        # Wait for fill — aggressive limit fills within seconds on liquid options
+        for wait in (5, 10, 15):
+            time.sleep(wait)
+            status = self.kite.get_order_status(order_id)
+            if status.get("status") == "COMPLETE":
+                fill = float(status.get("average_price") or price)
+                log.info("[ORDER] FILLED %s %s @ %.2f (limit=%.2f)", txn, symbol, fill, price)
+                return fill
+            log.info("[ORDER] Waiting for fill: %s status=%s", symbol, status.get("status"))
+
+        raise OrderFillError(f"Order not filled after 30s for {symbol} — check Kite")
 
     def enter_iron_fly(
         self,
